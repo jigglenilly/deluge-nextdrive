@@ -1,0 +1,19 @@
+{
+    "file": 1,
+    "format": 1
+}{
+    "enabled": true,
+    "locations": [
+        {"path": "/downloads/disk1", "reserve_gb": null, "label": ""},
+        {"path": "/downloads/disk2", "reserve_gb": 100, "label": ""},
+        {"path": "/downloads/disk3", "reserve_gb": null, "label": "overflow"}
+    ],
+    "reserve_gb": 50.0,
+    "only_default_location": true,
+    "override_label_paths": false,
+    "pause_if_no_fit": false,
+    "handle_magnets": true,
+    "count_committed": true,
+    "label_delay": 10,
+    "pending_magnets": {}
+}
