@@ -60,7 +60,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
             items: [
                 { xtype: 'label', html: _('Top row is tried first. Torrents go to the first path with room for the torrent plus its reserve. Data that has been downloaded is never moved.') + '<br><br>' },
                 { xtype: 'checkbox', name: 'enabled', boxLabel: _('Enabled'), hideLabel: true },
-                { xtype: 'numberfield', name: 'reserve_gb', fieldLabel: _('Default reserve (GiB)'), minValue: 0, decimalPrecision: 2, width: 60 },
+                { xtype: 'numberfield', name: 'reserve_gb', fieldLabel: _('Default reserve (GiB)'), minValue: 0, decimalPrecision: 3, width: 60 },
                 { xtype: 'checkbox', name: 'only_default_location', boxLabel: _('Only reroute torrents headed to the default download folder'), hideLabel: true },
                 { xtype: 'checkbox', name: 'handle_magnets', boxLabel: _('Hold magnets until metadata arrives, then decide'), hideLabel: true },
                 { xtype: 'checkbox', name: 'count_committed', boxLabel: _('Count space still owed to unfinished downloads'), hideLabel: true },
@@ -99,6 +99,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
     loadConfig: function () {
         deluge.client.nextdrive.get_config({
             success: function (config) {
+                this.loaded = true;
                 var rows = [];
                 Ext.each(config.locations, function (loc) {
                     rows.push({ path: loc.path, reserve_gb: loc.reserve_gb === null ? '' : loc.reserve_gb, label: loc.label || '', free: '' });
@@ -118,7 +119,9 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
                 Ext.each(report, function (e) { byPath[e.path] = e; });
                 this.store.each(function (rec) {
                     var e = byPath[rec.get('path')];
-                    var txt = !e ? '' : (e.ok ? (e.available / 1073741824).toFixed(1) + ' GiB' : _('missing'));
+                    var txt = !e ? '' : (!e.ok ? _('unavailable') : (e.available >= 1073741824
+                        ? (e.available / 1073741824).toFixed(1) + ' GiB'
+                        : Math.max(0, e.available / 1048576).toFixed(0) + ' MiB'));
                     rec.set('free', txt);
                     rec.commit();
                 });
@@ -128,6 +131,9 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
     },
 
     onApply: function () {
+        // Preferences calls onApply on every page, even ones never opened.
+        // Only save what the user could actually see and edit.
+        if (!this.loaded) return;
         this.grid.stopEditing();
         var locations = [];
         this.store.each(function (rec) {
@@ -139,14 +145,24 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
         var v = this.form.getForm().getFieldValues();
         deluge.client.nextdrive.set_config({
             enabled: v.enabled,
-            reserve_gb: v.reserve_gb === '' ? 50 : v.reserve_gb,
+            reserve_gb: v.reserve_gb === '' ? 5 : v.reserve_gb,
             only_default_location: v.only_default_location,
             handle_magnets: v.handle_magnets,
             count_committed: v.count_committed,
             override_label_paths: v.override_label_paths,
             pause_if_no_fit: v.pause_if_no_fit,
             locations: locations,
-        }, { success: this.loadConfig, scope: this });
+        }, {
+            success: this.loadConfig,
+            failure: function (res) {
+                var err = res && res.error;
+                var msg = (err && (err.message || err.msg)) || _('Settings were not saved.');
+                Ext.MessageBox.show({ title: _('NextDrive'), msg: Ext.util.Format.htmlEncode(msg),
+                    buttons: Ext.MessageBox.OK, icon: Ext.MessageBox.ERROR });
+                this.loadConfig();
+            },
+            scope: this,
+        });
     },
 });
 

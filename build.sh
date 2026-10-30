@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# Copyright (C) 2026 jigglenilly
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Build the NextDrive .egg. Deluge only loads eggs built for its own Python
 # version, so run this with the same Python minor version as your Deluge
 # (check with: deluged --version).

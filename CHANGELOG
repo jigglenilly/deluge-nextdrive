@@ -5,3 +5,14 @@ deluge-nextdrive changelog
 v1.0.0
 ------
 + Basic functionality.
++ Default reserve is now 5 GiB.
++ Magnets waiting for metadata stay on hold across a daemon restart.
++ A resumed paused magnet is no longer paused again once its metadata arrives.
++ Space being filled by torrents added a moment ago is now counted, so a burst of adds no longer overfills a drive.
++ Magnets being moved to another drive are counted on the drive they are moving to.
++ Data already on any listed drive is reused instead of downloaded again.
++ Bad settings (relative paths, inf/nan or text reserves, bad labels, "false" as text) are rejected and nothing is changed.
++ Setting errors are shown in the Web UI instead of hanging it.
++ Clicking Apply in Preferences without opening the NextDrive page no longer clears the drive list.
++ Old or damaged config files are repaired on start instead of breaking magnet adds.
++ A NextDrive error can no longer stop a torrent from being added.

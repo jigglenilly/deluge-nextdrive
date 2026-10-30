@@ -19,13 +19,17 @@ torrents that were already in the session.
 """
 
 import logging
+import math
 import os
+import re
 import shutil
+import time
 
 import deluge.component as component
 import deluge.configmanager
 from deluge._libtorrent import lt
 from deluge.core.rpcserver import export
+from deluge.error import DelugeError
 from deluge.plugins.pluginbase import CorePluginBase
 from twisted.internet import reactor
 
@@ -40,7 +44,7 @@ DEFAULT_PREFS = {
     # reserve_gb None/blank means "use the global reserve_gb".
     'locations': [],
     # Global free-space reserve in GiB kept on every location.
-    'reserve_gb': 50.0,
+    'reserve_gb': 5.0,
     # Only reroute torrents that were going to Deluge's default download
     # location. A torrent added with an explicit, different path is left alone.
     'only_default_location': True,
@@ -63,8 +67,105 @@ DEFAULT_PREFS = {
 }
 
 
+# Same rule the Label plugin uses for label names.
+LABEL_RE = re.compile(r'[a-z0-9_\-\.]*\Z')
+INFLIGHT_TTL = 300  # seconds an add may take before its reservation is dropped
+
+
+# Errors must use a class the clients know (deluge.error), or the Web UI and
+# other clients cannot rebuild the error and the call hangs.
+NextDriveError = DelugeError
+
+
 def _norm(path):
     return os.path.normpath(os.path.expanduser(path or '')).rstrip(os.sep) or os.sep
+
+
+def _to_bool(value, name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in (
+            'true', 'yes', 'on', '1', 'false', 'no', 'off', '0'):
+        return value.strip().lower() in ('true', 'yes', 'on', '1')
+    raise NextDriveError('%s must be true or false, got %r' % (name, value))
+
+
+def _to_number(value, name, cast=float):
+    if isinstance(value, bool) or value is None:
+        raise NextDriveError('%s must be a number, got %r' % (name, value))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise NextDriveError('%s must be a number, got %r' % (name, value))
+    if not math.isfinite(number):
+        raise NextDriveError('%s must be a finite number, got %r' % (name, value))
+    return cast(max(0, number))
+
+
+def _clean_location(loc):
+    """Validate one location entry. Accepts a dict or a bare path string."""
+    if isinstance(loc, str):
+        loc = {'path': loc}
+    if not isinstance(loc, dict):
+        raise NextDriveError('location must be a path or an object, got %r' % (loc,))
+    path = loc.get('path')
+    if not isinstance(path, str) or not path.strip():
+        raise NextDriveError('location has no path: %r' % (loc,))
+    path = path.strip()
+    if not os.path.isabs(os.path.expanduser(path)):
+        raise NextDriveError('location path must be absolute: %r' % path)
+    reserve = loc.get('reserve_gb')
+    if isinstance(reserve, str) and not reserve.strip():
+        reserve = None
+    if reserve is not None:
+        reserve = _to_number(reserve, 'reserve_gb for %s' % path)
+    label = loc.get('label') or ''
+    if not isinstance(label, str):
+        raise NextDriveError('label for %s must be text, got %r' % (path, label))
+    label = label.strip().lower()
+    if not LABEL_RE.match(label):
+        raise NextDriveError('label %r for %s may only use a-z 0-9 _ - .' % (label, path))
+    return {'path': _norm(path), 'reserve_gb': reserve, 'label': label}
+
+
+def _clean_locations(value, lenient=False):
+    if not isinstance(value, (list, tuple)):
+        if lenient:
+            log.warning('NextDrive: ignoring bad locations setting %r', value)
+            return []
+        raise NextDriveError('locations must be a list, got %r' % (value,))
+    clean, seen = [], set()
+    for loc in value:
+        try:
+            entry = _clean_location(loc)
+        except NextDriveError as ex:
+            if not lenient:
+                raise
+            try:  # keep the drive, drop its bad reserve/label
+                entry = _clean_location({'path': loc.get('path')} if isinstance(loc, dict) else loc)
+                log.warning('NextDrive: %s; using defaults for %s', ex, entry['path'])
+            except NextDriveError:
+                log.warning('NextDrive: ignoring bad location in config: %s', ex)
+                continue
+        if entry['path'] in seen:
+            continue
+        seen.add(entry['path'])
+        clean.append(entry)
+    return clean
+
+
+def _clean_value(key, value, lenient=False):
+    if key == 'locations':
+        return _clean_locations(value, lenient)
+    if key == 'reserve_gb':
+        return _to_number(value, key)
+    if key == 'label_delay':
+        return _to_number(value, key, int)
+    if key == 'pending_magnets':
+        return value if isinstance(value, dict) else {}
+    return _to_bool(value, key)
 
 
 def _h(num):
@@ -92,9 +193,10 @@ class Core(CorePluginBase):
         self.config = deluge.configmanager.ConfigManager(
             'nextdrive.conf', DEFAULT_PREFS
         )
+        self._sanitize_config()
         self.tm = component.get('TorrentManager')
         self.core_config = component.get('Core').config
-        self._inflight = {}  # torrent_id -> (st_dev, bytes) chosen but not yet in tm
+        self._inflight = {}  # torrent_id -> (st_dev, bytes, time) chosen, not yet in tm
         self._holding = False
         self._wrapped = {}
 
@@ -115,7 +217,30 @@ class Core(CorePluginBase):
             'NextDrive enabled with %d location(s)', len(self.config['locations'])
         )
 
+    def _sanitize_config(self):
+        """Repair a hand-edited, old or damaged config instead of failing later."""
+        changed = False
+        for key, default in DEFAULT_PREFS.items():
+            try:
+                value = _clean_value(key, self.config[key], lenient=True)
+            except NextDriveError as ex:
+                log.warning('NextDrive: bad %s in config (%s), using %r', key, ex, default)
+                value = default
+            if value != self.config[key] or type(value) is not type(self.config[key]):
+                self._put(key, value)
+                changed = True
+        if changed:
+            self.config.save()
+
+    def _put(self, key, value):
+        # Deluge's Config casts new values to the stored type (a stored int
+        # would turn 2.5 into 2, a stored list would turn {} into []).
+        if key in self.config.config and type(self.config[key]) is not type(value):
+            del self.config[key]
+        self.config[key] = value
+
     def disable(self):
+        shutting_down = getattr(self.tm, '_component_state', 'Started') != 'Started'
         for name, (original, had_attr, wrapper) in self._wrapped.items():
             if getattr(self.tm, name, None) is wrapper:
                 if had_attr:
@@ -127,11 +252,16 @@ class Core(CorePluginBase):
         em = component.get('EventManager')
         em.deregister_event_handler('TorrentRemovedEvent', self._on_torrent_removed)
         em.deregister_event_handler('SessionStartedEvent', self._rearm_pending)
-        # Never leave a magnet stuck on hold when the plugin goes away.
-        for torrent_id, info in list(self.config['pending_magnets'].items()):
-            self._release(torrent_id, info)
-        self.config['pending_magnets'] = {}
-        self.config.save()
+        if shutting_down:
+            # Daemon is stopping: keep held magnets on hold and remember them,
+            # so the decision is still made after the restart.
+            self.config.save()
+        else:
+            # Plugin switched off by the user: never leave a magnet stuck on hold.
+            for torrent_id in list(self.config['pending_magnets']):
+                self._release(torrent_id)
+            self.config['pending_magnets'] = {}
+            self.config.save()
         log.info('NextDrive disabled')
 
     def update(self):
@@ -143,38 +273,56 @@ class Core(CorePluginBase):
     def _wrap_add(self, original):
         def add(torrent_info=None, state=None, options=None, save_state=True,
                 filedump=None, filename=None, magnet=None, resume_data=None):
-            options = self._pre_add(torrent_info, state, options, filedump,
-                                    magnet, resume_data)
+            options, reserved = self._pre_add(torrent_info, state, options,
+                                              filedump, magnet, resume_data)
             self._holding = bool(
                 magnet and not torrent_info and not filedump and state is None
                 and self._should_hold_magnet(options)
             )
             try:
-                return original(torrent_info=torrent_info, state=state,
-                                options=options, save_state=save_state,
-                                filedump=filedump, filename=filename,
-                                magnet=magnet, resume_data=resume_data)
+                result = original(torrent_info=torrent_info, state=state,
+                                  options=options, save_state=save_state,
+                                  filedump=filedump, filename=filename,
+                                  magnet=magnet, resume_data=resume_data)
+            except Exception:
+                self._inflight.pop(reserved, None)
+                raise
             finally:
                 self._holding = False
+            if reserved and hasattr(result, 'addErrback'):
+                def drop(failure):
+                    self._inflight.pop(reserved, None)
+                    return failure
+                result.addErrback(drop)
+            return result
 
         return add
 
     def _wrap_add_async(self, original):
         def add_async(torrent_info=None, state=None, options=None, save_state=True,
                       filedump=None, filename=None, magnet=None, resume_data=None):
-            options = self._pre_add(torrent_info, state, options, filedump,
-                                    magnet, resume_data)
+            options, reserved = self._pre_add(torrent_info, state, options,
+                                              filedump, magnet, resume_data)
             self._holding = bool(
                 magnet and not torrent_info and not filedump and state is None
                 and self._should_hold_magnet(options)
             )
             try:
-                return original(torrent_info=torrent_info, state=state,
-                                options=options, save_state=save_state,
-                                filedump=filedump, filename=filename,
-                                magnet=magnet, resume_data=resume_data)
+                result = original(torrent_info=torrent_info, state=state,
+                                  options=options, save_state=save_state,
+                                  filedump=filedump, filename=filename,
+                                  magnet=magnet, resume_data=resume_data)
+            except Exception:
+                self._inflight.pop(reserved, None)
+                raise
             finally:
                 self._holding = False
+            if reserved and hasattr(result, 'addErrback'):
+                def drop(failure):
+                    self._inflight.pop(reserved, None)
+                    return failure
+                result.addErrback(drop)
+            return result
 
         return add_async
 
@@ -185,12 +333,15 @@ class Core(CorePluginBase):
             if self._holding and magnet and not torrent_info:
                 params['flags'] = params['flags'] | lt.torrent_flags.upload_mode
                 self.config['pending_magnets'][torrent_id] = {
-                    'was_paused': bool(options['add_paused']),
                     'pause_if_no_fit': bool(self.config['pause_if_no_fit']),
                 }
                 self.config.save()
                 log.info('NextDrive: holding magnet %s until metadata arrives',
                          torrent_id)
+            elif torrent_id in self.config['pending_magnets']:
+                # Reloaded after a restart before its decision was made: keep
+                # it on hold from the very first moment.
+                params['flags'] = params['flags'] | lt.torrent_flags.upload_mode
             return torrent_id, params
 
         return _build_torrent_params
@@ -216,14 +367,19 @@ class Core(CorePluginBase):
         return True
 
     def _should_hold_magnet(self, options):
-        return bool(
-            self.config['handle_magnets']
-            and not (options or {}).get('seed_mode')
-            and self._eligible(options)
-        )
+        try:
+            return bool(
+                self.config['handle_magnets']
+                and not (options or {}).get('seed_mode')
+                and self._eligible(options)
+            )
+        except Exception as ex:  # never block an add because of NextDrive
+            log.warning('NextDrive: magnet check failed, adding normally: %s', ex)
+            return False
 
     def _locations(self):
-        return [loc for loc in self.config['locations'] if loc.get('path')]
+        return [loc for loc in self.config['locations']
+                if isinstance(loc, dict) and loc.get('path')]
 
     def _reserve_bytes(self, loc):
         reserve = loc.get('reserve_gb')
@@ -231,29 +387,45 @@ class Core(CorePluginBase):
             reserve = self.config['reserve_gb']
         return int(float(reserve) * GIB)
 
+    def _existing_data(self, name, requested):
+        """Folder (requested first, then each location) that already holds name."""
+        if not name:
+            return None
+        for folder in [requested] + [loc['path'] for loc in self._locations()]:
+            if os.path.exists(os.path.join(_norm(folder), name)):
+                return folder
+        return None
+
     def _committed_by_dev(self, exclude=None):
         """Bytes still to be written by unfinished torrents, per device."""
         committed = {}
         if not self.config['count_committed']:
             return committed
+        pending = self.config['pending_magnets']
+        now = time.monotonic()
+        for torrent_id, (_dev, _size, since) in list(self._inflight.items()):
+            if now - since > INFLIGHT_TTL:
+                self._inflight.pop(torrent_id, None)
         for torrent_id, torrent in list(self.tm.torrents.items()):
             self._inflight.pop(torrent_id, None)
-            if torrent_id == exclude:
-                continue
+            if torrent_id == exclude or torrent_id in pending:
+                continue  # undecided magnets are counted when they are placed
             try:
                 if torrent.options.get('pre_allocate_storage'):
                     continue  # space already taken on disk
                 status = torrent.handle.status()
                 if not status.has_metadata:
                     continue
-                remaining = status.total_wanted - status.total_wanted_done
+                remaining = self._remaining(torrent, status)
                 if remaining <= 0:
                     continue
-                dev = _dev_of(status.save_path)
+                # A just-placed magnet is still moving: count it at its target.
+                dev = _dev_of(getattr(torrent, 'moving_storage_dest_path', None)
+                              or status.save_path)
             except RuntimeError:
                 continue
             committed[dev] = committed.get(dev, 0) + remaining
-        for torrent_id, (dev, size) in self._inflight.items():
+        for torrent_id, (dev, size, _since) in self._inflight.items():
             if torrent_id != exclude:
                 committed[dev] = committed.get(dev, 0) + size
         return committed
@@ -270,7 +442,12 @@ class Core(CorePluginBase):
                 report.append(entry)
                 continue
             dev = _dev_of(path)
-            entry['free'] = shutil.disk_usage(path).free
+            try:
+                entry['free'] = shutil.disk_usage(path).free
+            except OSError as ex:
+                entry['error'] = 'cannot read free space: %s' % ex
+                report.append(entry)
+                continue
             entry['committed'] = committed.get(dev, 0)
             entry['available'] = entry['free'] - entry['committed']
             entry['fits'] = entry['available'] >= size + entry['reserve']
@@ -357,57 +534,79 @@ class Core(CorePluginBase):
         files = torrent_info.files()
         total = 0
         for index in range(torrent_info.num_files()):
+            if files.file_flags(index) & lt.file_storage.flag_pad_file:
+                continue  # padding is never written to disk
             prio = prios[index] if index < len(prios) else 1
             if prio:
                 total += files.file_size(index)
         return total
+
+    def _remaining(self, torrent, status):
+        """Bytes this torrent still has to write.
+
+        Right after an add (or when metadata has only just arrived) libtorrent
+        can report total_wanted as 0, so fall back to the torrent's file list.
+        """
+        total = status.total_wanted
+        if total <= 0:
+            info = torrent.handle.torrent_file()
+            if info is None:
+                return 0
+            total = self._wanted_size(info, {
+                'file_priorities': torrent.options.get('file_priorities')})
+        return max(0, total - status.total_wanted_done)
 
     # ------------------------------------------------------------------ #
     # .torrent files: decide before libtorrent sees the torrent
     # ------------------------------------------------------------------ #
     def _pre_add(self, torrent_info, state, options, filedump, magnet, resume_data):
         if state is not None or resume_data is not None:
-            return options  # loading the session; never touch existing torrents
+            return options, None  # loading the session; never touch existing torrents
         try:
-            if torrent_info is None and filedump:
-                torrent_info = lt.torrent_info(lt.bdecode(filedump))
-            if torrent_info is None:
-                return options  # magnet without metadata: handled later
-            options = dict(options or {})
-            if options.get('seed_mode'):
-                return options  # data already exists where the caller said
-            if not self._eligible(options):
-                return options
-            torrent_id = str(torrent_info.info_hash())
-            if torrent_id in self.tm.torrents:
-                return options
-            requested = self._requested_location(options)
-            name = options.get('name') or torrent_info.name()
-            if name and os.path.exists(os.path.join(requested, name)):
-                log.info('NextDrive: data for "%s" already exists in %s, '
-                         'leaving it there', name, requested)
-                return options
-            if self._label_blocks(self._predict_label(torrent_info)):
-                return options
-
-            size = self._wanted_size(torrent_info, options)
-            entry = self._choose(size)
-            if entry is None:
-                log.warning('NextDrive: no location has room for "%s" (%s); '
-                            'leaving it on %s', name, _h(size), requested)
-                if self.config['pause_if_no_fit']:
-                    options['add_paused'] = True
-                return options
-            self._inflight[torrent_id] = (entry['dev'], size)
-            if _norm(entry['path']) != _norm(requested):
-                options['download_location'] = entry['path']
-            log.info('NextDrive: "%s" (%s) -> %s', name, _h(size),
-                     entry['path'])
-            reactor.callLater(0, self._schedule_label, torrent_id, entry)
-            return options
+            return self._pre_add_checked(torrent_info, options, filedump)
         except Exception as ex:  # never block an add because of NextDrive
             log.exception('NextDrive: pre-add check failed, adding normally: %s', ex)
-            return options
+            return options, None
+
+    def _pre_add_checked(self, torrent_info, options, filedump):
+        if torrent_info is None and filedump:
+            torrent_info = lt.torrent_info(lt.bdecode(filedump))
+        if torrent_info is None:
+            return options, None  # magnet without metadata: handled later
+        options = dict(options or {})
+        if options.get('seed_mode'):
+            return options, None  # data already exists where the caller said
+        if not self._eligible(options):
+            return options, None
+        torrent_id = str(torrent_info.info_hash())
+        if torrent_id in self.tm.torrents:
+            return options, None
+        requested = self._requested_location(options)
+        name = torrent_info.name()
+        existing = self._existing_data(name, requested)
+        if existing is not None:
+            if _norm(existing) != _norm(requested):
+                options['download_location'] = existing
+            log.info('NextDrive: data for "%s" already exists in %s, using it',
+                     name, existing)
+            return options, None
+        if self._label_blocks(self._predict_label(torrent_info)):
+            return options, None
+
+        size = self._wanted_size(torrent_info, options)
+        entry = self._choose(size)
+        if entry is None:
+            log.warning('NextDrive: no location has room for "%s" (%s); '
+                        'leaving it on %s', name, _h(size), requested)
+            if self.config['pause_if_no_fit']:
+                options['add_paused'] = True
+            return options, None
+        self._inflight[torrent_id] = (entry['dev'], size, time.monotonic())
+        if _norm(entry['path']) != _norm(requested):
+            options['download_location'] = entry['path']
+        log.info('NextDrive: "%s" (%s) -> %s', name, _h(size), entry['path'])
+        reactor.callLater(0, self._schedule_label, torrent_id, entry)
+        return options, torrent_id
 
     # ------------------------------------------------------------------ #
     # Magnets: decide when metadata arrives, while still at 0 bytes
@@ -427,25 +626,31 @@ class Core(CorePluginBase):
         torrent = self.tm.torrents.get(torrent_id)
         if torrent is None:
             return
-        keep_paused = info.get('was_paused', False)
+        pause = False
         try:
             status = torrent.handle.status()
             if status.total_done > 0:
                 log.warning('NextDrive: magnet %s already has data, not moving it',
                             torrent_id)
                 return
-            if self._label_blocks(self._label_core() and
-                                  self._label_core().torrent_labels.get(torrent_id)):
-                return
-            size = status.total_wanted
             current = status.save_path
+            existing = self._existing_data(status.name, current)
+            if existing is not None:
+                if _norm(existing) != _norm(current):
+                    torrent.move_storage(existing)
+                log.info('NextDrive: data for magnet "%s" already exists in %s, '
+                         'using it', status.name, existing)
+                return
+            label_core = self._label_core()
+            if self._label_blocks(label_core and label_core.torrent_labels.get(torrent_id)):
+                return
+            size = self._remaining(torrent, status)
             entry = self._choose(size, exclude=torrent_id)
             if entry is None:
                 log.warning('NextDrive: no location has room for magnet "%s" '
                             '(%s); leaving it on %s', status.name,
                             _h(size), current)
-                if info.get('pause_if_no_fit'):
-                    keep_paused = True
+                pause = bool(info.get('pause_if_no_fit'))
                 return
             if _norm(entry['path']) != _norm(current):
                 torrent.move_storage(entry['path'])
@@ -455,14 +660,14 @@ class Core(CorePluginBase):
         except Exception as ex:
             log.exception('NextDrive: magnet decision failed: %s', ex)
         finally:
-            self._release(torrent_id, {'was_paused': keep_paused})
+            self._release(torrent_id, pause)
 
-    def _release(self, torrent_id, info):
+    def _release(self, torrent_id, pause=False):
         torrent = self.tm.torrents.get(torrent_id)
         if torrent is None:
             return
         try:
-            if info.get('was_paused'):
+            if pause:
                 torrent.pause()
             torrent.handle.unset_flags(lt.torrent_flags.upload_mode)
         except RuntimeError as ex:
@@ -496,34 +701,22 @@ class Core(CorePluginBase):
 
     @export
     def set_config(self, config):
+        """Validate everything first; on any bad value nothing is changed."""
+        if not isinstance(config, dict):
+            raise NextDriveError('config must be an object')
+        clean = {}
         for key, value in config.items():
             if key == 'pending_magnets' or key not in DEFAULT_PREFS:
                 continue
-            if key == 'locations':
-                clean, seen = [], set()
-                for loc in value or []:
-                    path = (loc.get('path') or '').strip()
-                    if not path or _norm(path) in seen:
-                        continue
-                    seen.add(_norm(path))
-                    reserve = loc.get('reserve_gb')
-                    reserve = None if reserve in (None, '') else max(0.0, float(reserve))
-                    clean.append({'path': _norm(path), 'reserve_gb': reserve,
-                                  'label': (loc.get('label') or '').strip().lower()})
-                value = clean
-            elif key == 'reserve_gb':
-                value = max(0.0, float(value))
-            elif key == 'label_delay':
-                value = max(0, int(value))
-            else:
-                value = bool(value)
-            self.config[key] = value
+            clean[key] = _clean_value(key, value)
+        for key, value in clean.items():
+            self._put(key, value)
         self.config.save()
 
     @export
     def get_status(self, size=0):
         """Per-location free/committed/fit report (sizes in bytes)."""
-        report = self._drive_report(int(size or 0))
+        report = self._drive_report(_to_number(size or 0, 'size', int))
         for entry in report:
             entry.pop('dev', None)
         return report
