@@ -4,9 +4,9 @@
 }{
     "enabled": true,
     "locations": [
-        {"path": "/downloads/disk1", "reserve_gb": null, "label": ""},
-        {"path": "/downloads/disk2", "reserve_gb": 100, "label": ""},
-        {"path": "/downloads/disk3", "reserve_gb": null, "label": "overflow"}
+        {"path": "/downloads/disk1/incomplete", "completed": "/downloads/disk1/complete", "reserve_gb": null, "label": ""},
+        {"path": "/downloads/disk2/incomplete", "completed": "/downloads/disk2/complete", "reserve_gb": 100, "label": ""},
+        {"path": "/downloads/disk3", "completed": "", "reserve_gb": null, "label": "overflow"}
     ],
     "reserve_gb": 5.0,
     "only_default_location": true,
@@ -15,5 +15,6 @@
     "handle_magnets": true,
     "count_committed": true,
     "label_delay": 10,
-    "pending_magnets": {}
+    "pending_magnets": {},
+    "placed": {}
 }

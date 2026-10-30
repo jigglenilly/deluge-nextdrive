@@ -2,6 +2,14 @@ deluge-nextdrive changelog
 ==========================
 
 
+v1.1.0
+------
++ Optional completed path per location: finished downloads are moved to a folder on the drive they were downloaded to.
++ The completed path is kept when a label is set after the torrent was added, and across restarts.
++ A magnet placed on another drive is now still moved to its move-completed path when it finishes (Deluge turns that off after any storage move).
++ Labels whose move-completed path is under the first location's completed path no longer stop a torrent from being placed.
+
+
 v1.0.0
 ------
 + Basic functionality.

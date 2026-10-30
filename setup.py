@@ -6,7 +6,7 @@ from setuptools import find_packages, setup
 __plugin_name__ = 'NextDrive'
 __author__ = 'jigglenilly'
 __author_email__ = ''
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 __url__ = 'https://github.com/jigglenilly/deluge-nextdrive'
 __license__ = 'GPL-3.0-or-later'
 __description__ = 'Sends each new torrent to the first download location with room, before any data is written.'

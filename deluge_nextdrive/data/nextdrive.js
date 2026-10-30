@@ -15,7 +15,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
         Deluge.ux.preferences.NextDrivePage.superclass.initComponent.call(this);
 
         this.store = new Ext.data.JsonStore({
-            fields: ['path', 'reserve_gb', 'label', 'free'],
+            fields: ['path', 'completed', 'reserve_gb', 'label', 'free'],
         });
 
         var self = this;
@@ -28,8 +28,11 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
             sm: new Ext.grid.RowSelectionModel({ singleSelect: true }),
             columns: [
                 { header: '#', width: 28, renderer: function (v, m, r, row) { return row + 1; } },
-                { header: _('Download path'), dataIndex: 'path', width: 210,
+                { header: _('Download path'), dataIndex: 'path', width: 170,
                   editor: new Ext.form.TextField({ allowBlank: false }) },
+                { header: _('Completed path'), dataIndex: 'completed', width: 170,
+                  renderer: function (v) { return v ? Ext.util.Format.htmlEncode(v) : '<i>' + _('unchanged') + '</i>'; },
+                  editor: new Ext.form.TextField({ allowBlank: true }) },
                 { header: _('Reserve GiB'), dataIndex: 'reserve_gb', width: 80,
                   renderer: function (v) { return (v === null || v === '' || v === undefined) ? '<i>' + _('default') + '</i>' : v; },
                   editor: new Ext.form.NumberField({ allowBlank: true, minValue: 0, decimalPrecision: 2 }) },
@@ -58,7 +61,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
             bodyStyle: 'padding: 6px',
             labelWidth: 150,
             items: [
-                { xtype: 'label', html: _('Top row is tried first. Torrents go to the first path with room for the torrent plus its reserve. Data that has been downloaded is never moved.') + '<br><br>' },
+                { xtype: 'label', html: _('Top row is tried first. Torrents go to the first path with room for the torrent plus its reserve. Data that has been downloaded is never moved.') + '<br>' + _('Completed path (optional): a move-completed path under the top row\'s completed path is moved to the chosen row\'s completed path, keeping subfolders, so finished downloads stay on the same drive.') + '<br><br>' },
                 { xtype: 'checkbox', name: 'enabled', boxLabel: _('Enabled'), hideLabel: true },
                 { xtype: 'numberfield', name: 'reserve_gb', fieldLabel: _('Default reserve (GiB)'), minValue: 0, decimalPrecision: 3, width: 60 },
                 { xtype: 'checkbox', name: 'only_default_location', boxLabel: _('Only reroute torrents headed to the default download folder'), hideLabel: true },
@@ -75,7 +78,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
     onAddRow: function () {
         var Rec = this.store.recordType;
         this.grid.stopEditing();
-        this.store.add(new Rec({ path: '', reserve_gb: '', label: '', free: '' }));
+        this.store.add(new Rec({ path: '', completed: '', reserve_gb: '', label: '', free: '' }));
         this.grid.startEditing(this.store.getCount() - 1, 1);
     },
 
@@ -102,7 +105,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
                 this.loaded = true;
                 var rows = [];
                 Ext.each(config.locations, function (loc) {
-                    rows.push({ path: loc.path, reserve_gb: loc.reserve_gb === null ? '' : loc.reserve_gb, label: loc.label || '', free: '' });
+                    rows.push({ path: loc.path, completed: loc.completed || '', reserve_gb: loc.reserve_gb === null ? '' : loc.reserve_gb, label: loc.label || '', free: '' });
                 });
                 this.store.loadData(rows);
                 this.form.getForm().setValues(config);
@@ -139,7 +142,7 @@ Deluge.ux.preferences.NextDrivePage = Ext.extend(Ext.Panel, {
         this.store.each(function (rec) {
             var r = rec.get('reserve_gb');
             if (rec.get('path')) {
-                locations.push({ path: rec.get('path'), reserve_gb: (r === '' || r === null || r === undefined) ? null : r, label: rec.get('label') || '' });
+                locations.push({ path: rec.get('path'), completed: rec.get('completed') || '', reserve_gb: (r === '' || r === null || r === undefined) ? null : r, label: rec.get('label') || '' });
             }
         });
         var v = this.form.getForm().getFieldValues();

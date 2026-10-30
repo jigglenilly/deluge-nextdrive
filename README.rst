@@ -19,6 +19,7 @@ Features:
 * Reserve per drive, or one global default
 * Space still owed to unfinished downloads on the same drive is subtracted
 * Magnets are held at zero bytes until metadata arrives, then placed
+* Optional completed folder per drive, so finished downloads stay on the same drive
 * Optional label per drive (applied only to unlabeled torrents)
 * Respects Label plugin labels that have their own move-completed path
 * If nothing fits, the torrent stays on the default folder with a warning, optionally paused
@@ -57,7 +58,8 @@ Configuration
 Settings live in ``nextdrive.conf`` in the Deluge config directory. The Web UI page is the easiest
 way to change them; ``nextdrive.conf.example`` shows every key.
 
-* ``locations`` - ordered list of ``{path, reserve_gb, label}``. Empty ``reserve_gb`` means default.
+* ``locations`` - ordered list of ``{path, completed, reserve_gb, label}``. Empty ``reserve_gb`` means default.
+  Empty ``completed`` means move-completed paths are left alone.
 * ``reserve_gb`` - default free space to keep on each drive, in GiB (``5``).
 * ``only_default_location`` - only reroute torrents headed to the default download folder (``true``).
 * ``handle_magnets`` - hold magnets until metadata arrives, then decide (``true``).
@@ -67,6 +69,27 @@ way to change them; ``nextdrive.conf.example`` shows every key.
 * ``label_delay`` - seconds to wait before applying a drive label (``10``).
 
 Every decision is written to the Deluge log with the ``NextDrive:`` prefix.
+
+
+Completed folders
+-----------------
+
+If Deluge (or a label) moves finished downloads to a folder, a torrent placed on the second drive
+would be moved back to the first drive when it finishes. Give each location a ``completed`` folder
+to keep it on its own drive::
+
+    disk1: path /downloads/disk1/incomplete  completed /downloads/disk1/complete
+    disk2: path /downloads/disk2/incomplete  completed /downloads/disk2/complete
+
+A torrent placed on ``disk2`` whose move-completed path is under ``/downloads/disk1/complete``
+gets the same path under ``/downloads/disk2/complete`` instead, so a label folder
+``/downloads/disk1/complete/tv`` becomes ``/downloads/disk2/complete/tv``. Create those
+subfolders on every drive. Paths outside the first completed folder are left as they are.
+
+This applies only to torrents NextDrive placed, and it holds when a label is set or changed
+later and across restarts. Labels with a move-completed path under the first completed folder
+no longer stop a torrent from being placed. Apps that import finished downloads (for example
+\*arr apps) need to see every completed folder at the same path as Deluge.
 
 
 Safety

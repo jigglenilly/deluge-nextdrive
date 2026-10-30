@@ -16,6 +16,12 @@ reserve. The choice is made before libtorrent writes any data:
 
 NextDrive never moves a torrent that already has data and never touches
 torrents that were already in the session.
+
+A location can also have a completed folder. A torrent placed on a location
+then gets its move-completed path on the same drive: a path under the first
+location's completed folder is rewritten to the chosen location's completed
+folder, keeping any subfolder (such as a Label folder). This only applies to
+torrents NextDrive placed, and it is kept when a label is set later.
 """
 
 import logging
@@ -40,8 +46,9 @@ GIB = 1024**3
 DEFAULT_PREFS = {
     # Master switch.
     'enabled': True,
-    # Ordered list of {'path': str, 'reserve_gb': float or None, 'label': str}.
-    # reserve_gb None/blank means "use the global reserve_gb".
+    # Ordered list of {'path': str, 'reserve_gb': float or None, 'label': str,
+    # 'completed': str}. reserve_gb None/blank means "use the global
+    # reserve_gb". completed '' means "leave move-completed paths alone".
     'locations': [],
     # Global free-space reserve in GiB kept on every location.
     'reserve_gb': 5.0,
@@ -64,7 +71,13 @@ DEFAULT_PREFS = {
     'label_delay': 10,
     # Internal: magnets waiting for metadata {torrent_id: {...}}.
     'pending_magnets': {},
+    # Internal: torrents placed on a location with a completed folder
+    # {torrent_id: location path}, so their move-completed path stays on
+    # that drive across label changes and restarts.
+    'placed': {},
 }
+
+INTERNAL_KEYS = ('pending_magnets', 'placed')
 
 
 # Same rule the Label plugin uses for label names.
@@ -127,7 +140,17 @@ def _clean_location(loc):
     label = label.strip().lower()
     if not LABEL_RE.match(label):
         raise NextDriveError('label %r for %s may only use a-z 0-9 _ - .' % (label, path))
-    return {'path': _norm(path), 'reserve_gb': reserve, 'label': label}
+    completed = loc.get('completed') or ''
+    if not isinstance(completed, str):
+        raise NextDriveError('completed folder for %s must be text, got %r'
+                             % (path, completed))
+    completed = completed.strip()
+    if completed:
+        if not os.path.isabs(os.path.expanduser(completed)):
+            raise NextDriveError('completed folder must be absolute: %r' % completed)
+        completed = _norm(completed)
+    return {'path': _norm(path), 'reserve_gb': reserve, 'label': label,
+            'completed': completed}
 
 
 def _clean_locations(value, lenient=False):
@@ -143,7 +166,7 @@ def _clean_locations(value, lenient=False):
         except NextDriveError as ex:
             if not lenient:
                 raise
-            try:  # keep the drive, drop its bad reserve/label
+            try:  # keep the drive, drop its bad reserve/label/completed
                 entry = _clean_location({'path': loc.get('path')} if isinstance(loc, dict) else loc)
                 log.warning('NextDrive: %s; using defaults for %s', ex, entry['path'])
             except NextDriveError:
@@ -163,7 +186,7 @@ def _clean_value(key, value, lenient=False):
         return _to_number(value, key)
     if key == 'label_delay':
         return _to_number(value, key, int)
-    if key == 'pending_magnets':
+    if key in INTERNAL_KEYS:
         return value if isinstance(value, dict) else {}
     return _to_bool(value, key)
 
@@ -173,6 +196,17 @@ def _h(num):
     if abs(num) >= GIB:
         return '%.2f GiB' % (num / GIB)
     return '%.1f MiB' % (num / 1024**2)
+
+
+def _under(path, root):
+    """Part of path below root ('' for root itself), or None if not under it."""
+    path, root = _norm(path), _norm(root)
+    if path == root:
+        return ''
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    if path.startswith(prefix):
+        return path[len(prefix):]
+    return None
 
 
 def _dev_of(path):
@@ -199,6 +233,9 @@ class Core(CorePluginBase):
         self._inflight = {}  # torrent_id -> (st_dev, bytes, time) chosen, not yet in tm
         self._holding = False
         self._wrapped = {}
+        self._to_place = {}  # torrent_id -> (location path, time), added soon
+        self._hooked = {}  # torrent_id -> original set_move_completed_path
+        self._moving = {}  # torrent_id -> move_completed to restore after our move
 
         for name in ('add', 'add_async', '_build_torrent_params'):
             original = getattr(self.tm, name)
@@ -209,10 +246,14 @@ class Core(CorePluginBase):
 
         am = component.get('AlertManager')
         am.register_handler('metadata_received', self._on_metadata_received)
+        am.register_handler('storage_moved', self._on_storage_moved)
         em = component.get('EventManager')
         em.register_event_handler('TorrentRemovedEvent', self._on_torrent_removed)
+        em.register_event_handler('TorrentAddedEvent', self._on_torrent_added)
         em.register_event_handler('SessionStartedEvent', self._rearm_pending)
+        em.register_event_handler('SessionStartedEvent', self._prune_placed)
         reactor.callLater(0, self._rearm_pending)
+        reactor.callLater(0, self._hook_placed)
         log.info(
             'NextDrive enabled with %d location(s)', len(self.config['locations'])
         )
@@ -249,9 +290,14 @@ class Core(CorePluginBase):
                     delattr(self.tm, name)
         self._wrapped = {}
         component.get('AlertManager').deregister_handler(self._on_metadata_received)
+        component.get('AlertManager').deregister_handler(self._on_storage_moved)
         em = component.get('EventManager')
         em.deregister_event_handler('TorrentRemovedEvent', self._on_torrent_removed)
+        em.deregister_event_handler('TorrentAddedEvent', self._on_torrent_added)
         em.deregister_event_handler('SessionStartedEvent', self._rearm_pending)
+        em.deregister_event_handler('SessionStartedEvent', self._prune_placed)
+        for torrent_id in list(self._hooked):
+            self._unhook(torrent_id)
         if shutting_down:
             # Daemon is stopping: keep held magnets on hold and remember them,
             # so the decision is still made after the restart.
@@ -436,7 +482,8 @@ class Core(CorePluginBase):
         for loc in self._locations():
             path = _norm(loc['path'])
             entry = {'path': path, 'ok': False, 'free': 0, 'committed': 0,
-                     'reserve': self._reserve_bytes(loc), 'label': loc.get('label') or ''}
+                     'reserve': self._reserve_bytes(loc), 'label': loc.get('label') or '',
+                     'completed': loc.get('completed') or ''}
             if not os.path.isdir(path) or not os.access(path, os.W_OK):
                 entry['error'] = 'missing or not writable'
                 report.append(entry)
@@ -487,6 +534,8 @@ class Core(CorePluginBase):
         opts = label_core.labels.get(label_id, {})
         if opts.get('apply_move_completed') and opts.get('move_completed') \
                 and opts.get('move_completed_path'):
+            if self._mappable(opts['move_completed_path']):
+                return False  # kept on the chosen drive by its completed folder
             log.info('NextDrive: label "%s" has its own path, leaving torrent alone',
                      label_id)
             return True
@@ -589,6 +638,7 @@ class Core(CorePluginBase):
                 options['download_location'] = existing
             log.info('NextDrive: data for "%s" already exists in %s, using it',
                      name, existing)
+            self._will_place(torrent_id, existing)
             return options, None
         if self._label_blocks(self._predict_label(torrent_info)):
             return options, None
@@ -605,6 +655,7 @@ class Core(CorePluginBase):
         if _norm(entry['path']) != _norm(requested):
             options['download_location'] = entry['path']
         log.info('NextDrive: "%s" (%s) -> %s', name, _h(size), entry['path'])
+        self._will_place(torrent_id, entry['path'])
         reactor.callLater(0, self._schedule_label, torrent_id, entry)
         return options, torrent_id
 
@@ -637,9 +688,10 @@ class Core(CorePluginBase):
             existing = self._existing_data(status.name, current)
             if existing is not None:
                 if _norm(existing) != _norm(current):
-                    torrent.move_storage(existing)
+                    self._move(torrent, torrent_id, existing)
                 log.info('NextDrive: data for magnet "%s" already exists in %s, '
                          'using it', status.name, existing)
+                self._place(torrent_id, existing)
                 return
             label_core = self._label_core()
             if self._label_blocks(label_core and label_core.torrent_labels.get(torrent_id)):
@@ -653,14 +705,35 @@ class Core(CorePluginBase):
                 pause = bool(info.get('pause_if_no_fit'))
                 return
             if _norm(entry['path']) != _norm(current):
-                torrent.move_storage(entry['path'])
+                self._move(torrent, torrent_id, entry['path'])
             log.info('NextDrive: magnet "%s" (%s) -> %s', status.name,
                      _h(size), entry['path'])
+            self._place(torrent_id, entry['path'])
             self._schedule_label(torrent_id, entry)
         except Exception as ex:
             log.exception('NextDrive: magnet decision failed: %s', ex)
         finally:
             self._release(torrent_id, pause)
+
+    def _move(self, torrent, torrent_id, dest):
+        # Deluge switches move-completed off after any storage move, which
+        # would leave a placed magnet in its download folder forever. Remember
+        # the setting and put it back once the (empty) move is done.
+        self._moving[torrent_id] = bool(torrent.options.get('move_completed'))
+        if not torrent.move_storage(dest):
+            self._moving.pop(torrent_id, None)
+
+    def _on_storage_moved(self, alert):
+        try:
+            torrent_id = str(alert.handle.info_hash())
+        except RuntimeError:
+            return
+        if torrent_id not in self._moving:
+            return
+        move_completed = self._moving.pop(torrent_id)
+        torrent = self.tm.torrents.get(torrent_id)
+        if torrent is not None and move_completed:
+            torrent.set_move_completed(True)
 
     def _release(self, torrent_id, pause=False):
         torrent = self.tm.torrents.get(torrent_id)
@@ -670,6 +743,12 @@ class Core(CorePluginBase):
             if pause:
                 torrent.pause()
             torrent.handle.unset_flags(lt.torrent_flags.upload_mode)
+            # libtorrent can report a held magnet as finished when its metadata
+            # arrives. Deluge then marks it finished with nothing downloaded and
+            # would never move it to its move-completed path. Undo that.
+            if getattr(torrent, 'is_finished', False) \
+                    and not torrent.handle.status().is_finished:
+                torrent.is_finished = False
         except RuntimeError as ex:
             log.warning('NextDrive: could not release %s: %s', torrent_id, ex)
 
@@ -689,15 +768,128 @@ class Core(CorePluginBase):
 
     def _on_torrent_removed(self, torrent_id):
         self._inflight.pop(torrent_id, None)
-        if self.config['pending_magnets'].pop(torrent_id, None) is not None:
+        self._to_place.pop(torrent_id, None)
+        self._hooked.pop(torrent_id, None)
+        self._moving.pop(torrent_id, None)
+        changed = self.config['pending_magnets'].pop(torrent_id, None) is not None
+        changed = self.config['placed'].pop(torrent_id, None) is not None or changed
+        if changed:
             self.config.save()
+
+    # ------------------------------------------------------------------ #
+    # Completed folders: keep move-completed on the drive that was chosen
+    # ------------------------------------------------------------------ #
+    def _location(self, path):
+        for loc in self._locations():
+            if _norm(loc['path']) == _norm(path):
+                return loc
+        return None
+
+    def _mappable(self, completed_path):
+        """True if completed_path is under the first location's completed folder."""
+        locs = self._locations()
+        first = locs[0].get('completed') if locs else ''
+        return bool(first and completed_path and _under(completed_path, first) is not None)
+
+    def _map_completed(self, completed_path, location_path):
+        """completed_path moved onto location_path's drive, or unchanged."""
+        locs = self._locations()
+        loc = self._location(location_path)
+        if not locs or loc is None or not completed_path:
+            return completed_path
+        first, target = locs[0].get('completed'), loc.get('completed')
+        if not first or not target or _norm(first) == _norm(target):
+            return completed_path
+        rest = _under(completed_path, first)
+        if rest is None:
+            return completed_path
+        return os.path.join(target, rest) if rest else target
+
+    def _wants_place(self, location_path):
+        loc = self._location(location_path)
+        locs = self._locations()
+        return bool(loc and loc.get('completed') and locs[0].get('completed')
+                    and _norm(loc['path']) != _norm(locs[0]['path']))
+
+    def _will_place(self, torrent_id, location_path):
+        """A .torrent is about to be added on location_path."""
+        if self._wants_place(location_path):
+            self._to_place[torrent_id] = (location_path, time.monotonic())
+
+    def _on_torrent_added(self, torrent_id, from_state=False):
+        if from_state:
+            return
+        now = time.monotonic()
+        for other, (_path, since) in list(self._to_place.items()):
+            if now - since > INFLIGHT_TTL:
+                self._to_place.pop(other, None)
+        placed = self._to_place.pop(torrent_id, None)
+        if placed is not None:
+            self._place(torrent_id, placed[0])
+
+    def _place(self, torrent_id, location_path):
+        if not self._wants_place(location_path):
+            return
+        try:
+            self.config['placed'][torrent_id] = _norm(location_path)
+            self.config.save()
+            self._hook(torrent_id)
+        except Exception as ex:  # never break an add because of NextDrive
+            log.exception('NextDrive: could not set completed folder: %s', ex)
+
+    def _hook(self, torrent_id):
+        """Keep this torrent's move-completed path on its drive, now and later."""
+        torrent = self.tm.torrents.get(torrent_id)
+        if torrent is None:
+            return
+        if torrent_id not in self._hooked:
+            original = torrent.set_move_completed_path
+
+            def set_move_completed_path(path, _id=torrent_id, _orig=original):
+                location = self.config['placed'].get(_id)
+                if location:
+                    mapped = self._map_completed(path, location)
+                    if mapped != path:
+                        log.info('NextDrive: %s completes to %s instead of %s',
+                                 _id, mapped, path)
+                        path = mapped
+                return _orig(path)
+
+            torrent.set_move_completed_path = set_move_completed_path
+            self._hooked[torrent_id] = original
+        current = torrent.options.get('move_completed_path')
+        torrent.set_move_completed_path(current)
+
+    def _unhook(self, torrent_id):
+        self._hooked.pop(torrent_id, None)
+        torrent = self.tm.torrents.get(torrent_id)
+        if torrent is not None and 'set_move_completed_path' in torrent.__dict__:
+            del torrent.set_move_completed_path
+
+    def _hook_placed(self, *args):
+        for torrent_id in list(self.config['placed']):
+            try:
+                self._hook(torrent_id)
+            except Exception as ex:
+                log.warning('NextDrive: could not keep completed folder for %s: %s',
+                            torrent_id, ex)
+
+    def _prune_placed(self, *args):
+        """After all torrents are loaded: forget removed ones, hook the rest."""
+        placed = self.config['placed']
+        gone = [t for t in placed if t not in self.tm.torrents]
+        for torrent_id in gone:
+            placed.pop(torrent_id, None)
+        if gone:
+            self.config.save()
+        self._hook_placed()
 
     # ------------------------------------------------------------------ #
     # RPC
     # ------------------------------------------------------------------ #
     @export
     def get_config(self):
-        return {k: self.config[k] for k in DEFAULT_PREFS if k != 'pending_magnets'}
+        return {k: self.config[k] for k in DEFAULT_PREFS if k not in INTERNAL_KEYS}
 
     @export
     def set_config(self, config):
@@ -706,7 +898,7 @@ class Core(CorePluginBase):
             raise NextDriveError('config must be an object')
         clean = {}
         for key, value in config.items():
-            if key == 'pending_magnets' or key not in DEFAULT_PREFS:
+            if key in INTERNAL_KEYS or key not in DEFAULT_PREFS:
                 continue
             clean[key] = _clean_value(key, value)
         for key, value in clean.items():
